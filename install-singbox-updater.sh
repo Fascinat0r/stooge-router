@@ -13,6 +13,7 @@ MAX_TIME="${MAX_TIME:-30}"
 BACKUP_KEEP="${BACKUP_KEEP:-7}"
 APPLY_NOW="${APPLY_NOW:-1}"
 SHA256="${SHA256:-}"
+INSECURE_TLS="${INSECURE_TLS:-1}"
 
 say() {
 	echo "[$TAG] $*"
@@ -43,6 +44,7 @@ Optional env vars:
   BACKUP_KEEP=7
   APPLY_NOW=1            # after install, do real update test
   SHA256='...'           # optional SHA256 pinning for downloaded config
+  INSECURE_TLS=1         # use curl -k (enabled by default)
 
 Example:
   APPLY_NOW=1 RUN_ON_BOOT=1 RUN_ON_WAN_UP=1 sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
@@ -65,7 +67,10 @@ fetch_url() {
 	esac
 
 	if have_cmd curl; then
+		curl_insecure=""
+		[ "$INSECURE_TLS" = "1" ] && curl_insecure="-k"
 		curl -fsSL \
+			$curl_insecure \
 			--connect-timeout "$CONNECT_TIMEOUT" \
 			--max-time "$MAX_TIME" \
 			-o "$out" \
@@ -174,6 +179,7 @@ uci set singbox_updater.main.max_time="$MAX_TIME"
 uci set singbox_updater.main.backup_keep="$BACKUP_KEEP"
 uci set singbox_updater.main.run_on_boot="$RUN_ON_BOOT"
 uci set singbox_updater.main.run_on_wan_up="$RUN_ON_WAN_UP"
+uci set singbox_updater.main.insecure_tls="$INSECURE_TLS"
 if [ -n "$SHA256" ]; then
 	uci set singbox_updater.main.sha256="$SHA256"
 else
@@ -287,6 +293,7 @@ fetch_to_file() {
 	out="$2"
 	connect_timeout="$3"
 	max_time="$4"
+	insecure_tls="$5"
 
 	case "$url" in
 		/*)
@@ -297,7 +304,10 @@ fetch_to_file() {
 	esac
 
 	if command -v curl >/dev/null 2>&1; then
+		curl_insecure=""
+		[ "$insecure_tls" = "1" ] && curl_insecure="-k"
 		curl -fsSL \
+			$curl_insecure \
 			--connect-timeout "$connect_timeout" \
 			--max-time "$max_time" \
 			-o "$out" \
@@ -382,6 +392,8 @@ main_update() {
 	connect_timeout="$(get_uci connect_timeout)"; is_num "$connect_timeout" || connect_timeout=10
 	max_time="$(get_uci max_time)"; is_num "$max_time" || max_time=30
 	backup_keep="$(get_uci backup_keep)"; is_num "$backup_keep" || backup_keep=7
+	insecure_tls="$(get_uci insecure_tls)"
+	[ -n "$insecure_tls" ] || insecure_tls=1
 	want_sha256="$(get_uci sha256)"
 
 	ensure_dirs
@@ -411,7 +423,7 @@ main_update() {
 	sleep_s=2
 	ok=0
 	while [ "$attempt" -le "$retries" ]; do
-		if fetch_to_file "$url" "$NEW" "$connect_timeout" "$max_time"; then
+		if fetch_to_file "$url" "$NEW" "$connect_timeout" "$max_time" "$insecure_tls"; then
 			ok=1
 			break
 		fi
