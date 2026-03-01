@@ -14,6 +14,8 @@ BACKUP_KEEP="${BACKUP_KEEP:-7}"
 APPLY_NOW="${APPLY_NOW:-1}"
 SHA256="${SHA256:-}"
 INSECURE_TLS="${INSECURE_TLS:-1}"
+RESOLVE_HOST="${RESOLVE_HOST:-}"
+RESOLVE_IP="${RESOLVE_IP:-}"
 
 say() {
 	echo "[$TAG] $*"
@@ -27,6 +29,129 @@ die() {
 
 have_cmd() {
 	command -v "$1" >/dev/null 2>&1
+}
+
+trim_brackets() {
+	value="$1"
+	case "$value" in
+		\[*\]) value="${value#\[}"; value="${value%\]}" ;;
+	esac
+	echo "$value"
+}
+
+url_scheme() {
+	url="$1"
+	case "$url" in
+		*://*)
+			echo "${url%%://*}"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+url_authority() {
+	url="$1"
+	case "$url" in
+		*://*)
+			rest="${url#*://}"
+			echo "${rest%%/*}"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+url_host() {
+	authority="$(url_authority "$1" 2>/dev/null || true)"
+	[ -n "$authority" ] || return 1
+	hostport="${authority##*@}"
+	case "$hostport" in
+		\[*\]:*)
+			host="${hostport#\[}"
+			host="${host%%]*}"
+			echo "$host"
+			return 0
+			;;
+		\[*\])
+			host="${hostport#\[}"
+			host="${host%\]}"
+			echo "$host"
+			return 0
+			;;
+		*:*)
+			echo "${hostport%%:*}"
+			return 0
+			;;
+		*)
+			echo "$hostport"
+			return 0
+			;;
+	esac
+}
+
+url_port() {
+	url="$1"
+	scheme="$(url_scheme "$url" 2>/dev/null || true)"
+	authority="$(url_authority "$url" 2>/dev/null || true)"
+	[ -n "$authority" ] || return 1
+	hostport="${authority##*@}"
+	case "$hostport" in
+		\[*\]:*)
+			echo "${hostport##*]:}"
+			return 0
+			;;
+		\[*\])
+			:
+			;;
+		*:*)
+			echo "${hostport##*:}"
+			return 0
+			;;
+	esac
+	case "$scheme" in
+		https) echo 443 ;;
+		http) echo 80 ;;
+		*) return 1 ;;
+	esac
+}
+
+fetch_with_curl() {
+	url="$1"
+	out="$2"
+	insecure_tls="$3"
+	resolve_host="$4"
+	resolve_ip="$5"
+
+	set -- -fsSL
+
+	if [ "$insecure_tls" = "1" ]; then
+		say "using insecure TLS mode"
+		set -- "$@" -k
+	fi
+
+	url_host_value="$(url_host "$url" 2>/dev/null || true)"
+	url_scheme_value="$(url_scheme "$url" 2>/dev/null || true)"
+
+	if [ -n "$resolve_host" ] && [ -n "$resolve_ip" ]; then
+		if [ -n "$url_host_value" ] && [ "$url_host_value" = "$resolve_host" ]; then
+			if [ "$url_scheme_value" = "https" ]; then
+				resolve_port="$(url_port "$url" 2>/dev/null || echo 443)"
+				resolve_ip_fmt="$(trim_brackets "$resolve_ip")"
+				say "using curl --resolve for host $resolve_host:$resolve_port -> $resolve_ip_fmt"
+				set -- "$@" --resolve "$resolve_host:$resolve_port:$resolve_ip_fmt"
+			else
+				say "URL scheme '$url_scheme_value' is not https; skipping --resolve"
+			fi
+		else
+			say "URL host does not match resolve_host, skipping --resolve"
+		fi
+	else
+		say "downloading without custom resolve"
+	fi
+
+	set -- "$@" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o "$out" "$url"
+	curl "$@" >/dev/null 2>&1
 }
 
 usage() {
@@ -45,9 +170,12 @@ Optional env vars:
   APPLY_NOW=1            # after install, do real update test
   SHA256='...'           # optional SHA256 pinning for downloaded config
   INSECURE_TLS=1         # use curl -k (enabled by default)
+  RESOLVE_HOST=''        # optional: force this hostname to resolve locally
+  RESOLVE_IP=''          # optional: local backend IP for RESOLVE_HOST
 
 Example:
   APPLY_NOW=1 RUN_ON_BOOT=1 RUN_ON_WAN_UP=1 sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
+  RESOLVE_HOST='s3.example.com' RESOLVE_IP='192.168.1.10' INSECURE_TLS=1 sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
 USG
 }
 
@@ -67,18 +195,14 @@ fetch_url() {
 	esac
 
 	if have_cmd curl; then
-		curl_insecure=""
-		[ "$INSECURE_TLS" = "1" ] && curl_insecure="-k"
-		curl -fsSL \
-			$curl_insecure \
-			--connect-timeout "$CONNECT_TIMEOUT" \
-			--max-time "$MAX_TIME" \
-			-o "$out" \
-			"$url" >/dev/null 2>&1
+		fetch_with_curl "$url" "$out" "$INSECURE_TLS" "$RESOLVE_HOST" "$RESOLVE_IP"
 		return $?
 	fi
 
 	if have_cmd uclient-fetch; then
+		[ -z "$RESOLVE_HOST" ] || [ -z "$RESOLVE_IP" ] || say "curl is unavailable; custom --resolve cannot be applied"
+		[ "$INSECURE_TLS" = "1" ] && say "curl is unavailable; insecure TLS mode cannot be applied with uclient-fetch"
+		say "downloading with uclient-fetch"
 		uclient-fetch -q -O "$out" "$url" >/dev/null 2>&1
 		return $?
 	fi
@@ -180,6 +304,16 @@ uci set singbox_updater.main.backup_keep="$BACKUP_KEEP"
 uci set singbox_updater.main.run_on_boot="$RUN_ON_BOOT"
 uci set singbox_updater.main.run_on_wan_up="$RUN_ON_WAN_UP"
 uci set singbox_updater.main.insecure_tls="$INSECURE_TLS"
+if [ -n "$RESOLVE_HOST" ]; then
+	uci set singbox_updater.main.resolve_host="$RESOLVE_HOST"
+else
+	uci -q delete singbox_updater.main.resolve_host >/dev/null 2>&1 || true
+fi
+if [ -n "$RESOLVE_IP" ]; then
+	uci set singbox_updater.main.resolve_ip="$RESOLVE_IP"
+else
+	uci -q delete singbox_updater.main.resolve_ip >/dev/null 2>&1 || true
+fi
 if [ -n "$SHA256" ]; then
 	uci set singbox_updater.main.sha256="$SHA256"
 else
@@ -224,6 +358,131 @@ is_num() {
 
 get_uci() {
 	uci -q get "${UCI_SECTION}.${1}" 2>/dev/null || true
+}
+
+trim_brackets() {
+	value="$1"
+	case "$value" in
+		\[*\]) value="${value#\[}"; value="${value%\]}" ;;
+	esac
+	echo "$value"
+}
+
+url_scheme() {
+	url="$1"
+	case "$url" in
+		*://*)
+			echo "${url%%://*}"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+url_authority() {
+	url="$1"
+	case "$url" in
+		*://*)
+			rest="${url#*://}"
+			echo "${rest%%/*}"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+url_host() {
+	authority="$(url_authority "$1" 2>/dev/null || true)"
+	[ -n "$authority" ] || return 1
+	hostport="${authority##*@}"
+	case "$hostport" in
+		\[*\]:*)
+			host="${hostport#\[}"
+			host="${host%%]*}"
+			echo "$host"
+			return 0
+			;;
+		\[*\])
+			host="${hostport#\[}"
+			host="${host%\]}"
+			echo "$host"
+			return 0
+			;;
+		*:*)
+			echo "${hostport%%:*}"
+			return 0
+			;;
+		*)
+			echo "$hostport"
+			return 0
+			;;
+	esac
+}
+
+url_port() {
+	url="$1"
+	scheme="$(url_scheme "$url" 2>/dev/null || true)"
+	authority="$(url_authority "$url" 2>/dev/null || true)"
+	[ -n "$authority" ] || return 1
+	hostport="${authority##*@}"
+	case "$hostport" in
+		\[*\]:*)
+			echo "${hostport##*]:}"
+			return 0
+			;;
+		\[*\])
+			:
+			;;
+		*:*)
+			echo "${hostport##*:}"
+			return 0
+			;;
+	esac
+	case "$scheme" in
+		https) echo 443 ;;
+		http) echo 80 ;;
+		*) return 1 ;;
+	esac
+}
+
+fetch_with_curl() {
+	url="$1"
+	out="$2"
+	connect_timeout="$3"
+	max_time="$4"
+	insecure_tls="$5"
+	resolve_host="$6"
+	resolve_ip="$7"
+
+	set -- -fsSL
+
+	if [ "$insecure_tls" = "1" ]; then
+		log "using insecure TLS mode"
+		set -- "$@" -k
+	fi
+
+	url_host_value="$(url_host "$url" 2>/dev/null || true)"
+	url_scheme_value="$(url_scheme "$url" 2>/dev/null || true)"
+
+	if [ -n "$resolve_host" ] && [ -n "$resolve_ip" ]; then
+		if [ -n "$url_host_value" ] && [ "$url_host_value" = "$resolve_host" ]; then
+			if [ "$url_scheme_value" = "https" ]; then
+				resolve_port="$(url_port "$url" 2>/dev/null || echo 443)"
+				resolve_ip_fmt="$(trim_brackets "$resolve_ip")"
+				log "using curl --resolve for host $resolve_host:$resolve_port -> $resolve_ip_fmt"
+				set -- "$@" --resolve "$resolve_host:$resolve_port:$resolve_ip_fmt"
+			else
+				log "URL scheme '$url_scheme_value' is not https; skipping --resolve"
+			fi
+		else
+			log "URL host does not match resolve_host, skipping --resolve"
+		fi
+	else
+		log "downloading without custom resolve"
+	fi
+
+	set -- "$@" --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$out" "$url"
+	curl "$@" >/dev/null 2>&1
 }
 
 usage() {
@@ -294,6 +553,8 @@ fetch_to_file() {
 	connect_timeout="$3"
 	max_time="$4"
 	insecure_tls="$5"
+	resolve_host="$6"
+	resolve_ip="$7"
 
 	case "$url" in
 		/*)
@@ -304,18 +565,14 @@ fetch_to_file() {
 	esac
 
 	if command -v curl >/dev/null 2>&1; then
-		curl_insecure=""
-		[ "$insecure_tls" = "1" ] && curl_insecure="-k"
-		curl -fsSL \
-			$curl_insecure \
-			--connect-timeout "$connect_timeout" \
-			--max-time "$max_time" \
-			-o "$out" \
-			"$url" >/dev/null 2>&1
+		fetch_with_curl "$url" "$out" "$connect_timeout" "$max_time" "$insecure_tls" "$resolve_host" "$resolve_ip"
 		return $?
 	fi
 
 	if command -v uclient-fetch >/dev/null 2>&1; then
+		[ -z "$resolve_host" ] || [ -z "$resolve_ip" ] || log "curl is unavailable; custom --resolve cannot be applied"
+		[ "$insecure_tls" = "1" ] && log "curl is unavailable; insecure TLS mode cannot be applied with uclient-fetch"
+		log "downloading with uclient-fetch"
 		uclient-fetch -q -O "$out" "$url" >/dev/null 2>&1
 		return $?
 	fi
@@ -394,6 +651,8 @@ main_update() {
 	backup_keep="$(get_uci backup_keep)"; is_num "$backup_keep" || backup_keep=7
 	insecure_tls="$(get_uci insecure_tls)"
 	[ -n "$insecure_tls" ] || insecure_tls=1
+	resolve_host="$(get_uci resolve_host)"
+	resolve_ip="$(get_uci resolve_ip)"
 	want_sha256="$(get_uci sha256)"
 
 	ensure_dirs
@@ -417,13 +676,18 @@ main_update() {
 	mkdir -p "$TMPDIR" || die "Cannot create $TMPDIR"
 	rm -f "$NEW" >/dev/null 2>&1 || true
 
+	# resolve_host + resolve_ip exist for the case where the config source
+	# sits behind this same router. The public hostname points to this
+	# router's WAN IP, but the router itself should connect directly to the
+	# LAN backend while keeping the original hostname for TLS SNI and Host.
 	log "[$REASON] checking config from: $url"
+	[ -n "$resolve_host" ] && [ -n "$resolve_ip" ] && log "[$REASON] local resolve override configured: $resolve_host -> $resolve_ip"
 
 	attempt=1
 	sleep_s=2
 	ok=0
 	while [ "$attempt" -le "$retries" ]; do
-		if fetch_to_file "$url" "$NEW" "$connect_timeout" "$max_time" "$insecure_tls"; then
+		if fetch_to_file "$url" "$NEW" "$connect_timeout" "$max_time" "$insecure_tls" "$resolve_host" "$resolve_ip"; then
 			ok=1
 			break
 		fi
@@ -559,12 +823,18 @@ say "Enabling singbox-updater service"
 /etc/init.d/singbox-updater enable >/dev/null 2>&1 || true
 /etc/init.d/singbox-updater restart >/dev/null 2>&1 || /etc/init.d/singbox-updater start >/dev/null 2>&1 || true
 
+say "Configured UCI values"
+echo "url=$(uci -q get singbox_updater.main.url 2>/dev/null || true)"
+echo "insecure_tls=$(uci -q get singbox_updater.main.insecure_tls 2>/dev/null || true)"
+echo "resolve_host=$(uci -q get singbox_updater.main.resolve_host 2>/dev/null || true)"
+echo "resolve_ip=$(uci -q get singbox_updater.main.resolve_ip 2>/dev/null || true)"
+
 say "Running dry-run self-test"
 /usr/bin/singbox-config-update --reason installer --dry-run -v || die "Dry-run self-test failed"
 
 if [ "$APPLY_NOW" = "1" ]; then
 	say "Running real self-test"
-/usr/bin/singbox-config-update --reason installer -v || die "Real self-test failed"
+	/usr/bin/singbox-config-update --reason installer -v || die "Real self-test failed"
 else
 	say "Skipping real self-test because APPLY_NOW=$APPLY_NOW"
 fi
