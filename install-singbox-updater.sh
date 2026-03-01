@@ -268,14 +268,6 @@ ensure_cron_init() {
 	return 1
 }
 
-ensure_uci_package_file() {
-	cfg="/etc/config/singbox_updater"
-	if [ -f "$cfg" ]; then
-		return 0
-	fi
-	: > "$cfg" || die "Cannot create $cfg"
-}
-
 say "Checking sing-box presence"
 ensure_singbox
 
@@ -301,34 +293,38 @@ fi
 rm -f "$TMP_CHECK" >/dev/null 2>&1 || true
 
 say "Writing /etc/config/singbox_updater"
-ensure_uci_package_file
+mkdir -p /etc/config
+[ -f /etc/config/singbox_updater ] || touch /etc/config/singbox_updater
+say "UCI package file: /etc/config/singbox_updater"
+ls -l /etc/config/singbox_updater >/dev/null 2>&1 || die "UCI package file was not created"
+
 uci -q delete singbox_updater.main >/dev/null 2>&1 || true
-uci -q set singbox_updater.main='singbox_updater'
-uci -q set singbox_updater.main.url="$URL"
-uci -q set singbox_updater.main.schedule="$SCHEDULE"
-uci -q set singbox_updater.main.retries="$RETRIES"
-uci -q set singbox_updater.main.connect_timeout="$CONNECT_TIMEOUT"
-uci -q set singbox_updater.main.max_time="$MAX_TIME"
-uci -q set singbox_updater.main.backup_keep="$BACKUP_KEEP"
-uci -q set singbox_updater.main.run_on_boot="$RUN_ON_BOOT"
-uci -q set singbox_updater.main.run_on_wan_up="$RUN_ON_WAN_UP"
-uci -q set singbox_updater.main.insecure_tls="$INSECURE_TLS"
+uci set singbox_updater.main='singbox_updater' || die "Failed to create UCI section singbox_updater.main"
+uci set singbox_updater.main.url="$URL"
+uci set singbox_updater.main.schedule="$SCHEDULE"
+uci set singbox_updater.main.retries="$RETRIES"
+uci set singbox_updater.main.connect_timeout="$CONNECT_TIMEOUT"
+uci set singbox_updater.main.max_time="$MAX_TIME"
+uci set singbox_updater.main.backup_keep="$BACKUP_KEEP"
+uci set singbox_updater.main.run_on_boot="$RUN_ON_BOOT"
+uci set singbox_updater.main.run_on_wan_up="$RUN_ON_WAN_UP"
+uci set singbox_updater.main.insecure_tls="$INSECURE_TLS"
 if [ -n "$RESOLVE_HOST" ]; then
-	uci -q set singbox_updater.main.resolve_host="$RESOLVE_HOST"
+	uci set singbox_updater.main.resolve_host="$RESOLVE_HOST"
 else
 	uci -q delete singbox_updater.main.resolve_host >/dev/null 2>&1 || true
 fi
 if [ -n "$RESOLVE_IP" ]; then
-	uci -q set singbox_updater.main.resolve_ip="$RESOLVE_IP"
+	uci set singbox_updater.main.resolve_ip="$RESOLVE_IP"
 else
 	uci -q delete singbox_updater.main.resolve_ip >/dev/null 2>&1 || true
 fi
 if [ -n "$SHA256" ]; then
-	uci -q set singbox_updater.main.sha256="$SHA256"
+	uci set singbox_updater.main.sha256="$SHA256"
 else
 	uci -q delete singbox_updater.main.sha256 >/dev/null 2>&1 || true
 fi
-uci commit singbox_updater
+uci commit singbox_updater || die "Failed to commit /etc/config/singbox_updater"
 
 say "Writing /usr/bin/singbox-config-update"
 cat > /usr/bin/singbox-config-update <<'UPDATER_EOF'
