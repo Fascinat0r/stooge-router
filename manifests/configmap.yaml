@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stooge-router-config
+  namespace: stooge-router
+data:
+  DATA_DIR: "/data"
+  SUBSCRIPTION_USER_AGENT: "HiddifyNext/2.5.7 (Kubernetes CronJob)"
+  MINIO_SECURE: "true"
+  MINIO_CONTENT_TYPE: "application/json"
+  MINIO_REGION: ""

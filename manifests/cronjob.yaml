@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: stooge-router-nightly
+  namespace: stooge-router
+spec:
+  schedule: "0 3 * * *"
+  timeZone: "Europe/Stockholm"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: stooge-router
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: stooge-router
+              image: registry.example.local/stooge-router:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "src/run_subscription_pipeline.py"]
+              envFrom:
+                - configMapRef:
+                    name: stooge-router-config
+                - secretRef:
+                    name: stooge-router-secrets
+              volumeMounts:
+                - name: workdir
+                  mountPath: /data
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+          volumes:
+            - name: workdir
+              emptyDir: {}
