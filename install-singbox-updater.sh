@@ -17,6 +17,16 @@ INSECURE_TLS="${INSECURE_TLS:-1}"
 RESOLVE_HOST="${RESOLVE_HOST:-}"
 RESOLVE_IP="${RESOLVE_IP:-}"
 
+TELEGRAM_IP_LIST_URL="${TELEGRAM_IP_LIST_URL:-}"
+[ -n "$TELEGRAM_IP_LIST_URL" ] || TELEGRAM_IP_LIST_URL="${2:-}"
+TELEGRAM_IP_LIST_PATH="${TELEGRAM_IP_LIST_PATH:-/etc/sing-box/telegram_ip_cidrs_v4.txt}"
+TELEGRAM_IP_LIST_SHA256="${TELEGRAM_IP_LIST_SHA256:-}"
+TELEGRAM_IPSET_NAME="${TELEGRAM_IPSET_NAME:-telegram_ips}"
+TELEGRAM_RULE_NAME="${TELEGRAM_RULE_NAME:-mark_telegram_ips}"
+TELEGRAM_MARK_VALUE="${TELEGRAM_MARK_VALUE:-0x1}"
+TELEGRAM_FIREWALL_SETUP="${TELEGRAM_FIREWALL_SETUP:-1}"
+TELEGRAM_FIREWALL_RESTART="${TELEGRAM_FIREWALL_RESTART:-1}"
+
 say() {
 	echo "[$TAG] $*"
 	logger -t "$TAG" "$*" 2>/dev/null || true
@@ -158,24 +168,35 @@ usage() {
 	cat <<USG
 Usage:
   sh /root/install-singbox-updater.sh 'https://example.com/config.json'
+  sh /root/install-singbox-updater.sh 'https://example.com/config.json' 'https://example.com/telegram_ip_cidrs_v4.txt'
 
 Optional env vars:
-  SCHEDULE='0 4 * * *'   # cron schedule
-  RUN_ON_BOOT=1          # run once on boot
-  RUN_ON_WAN_UP=1        # run on WAN ifup
+  SCHEDULE='0 4 * * *'
+  RUN_ON_BOOT=1
+  RUN_ON_WAN_UP=1
   RETRIES=8
   CONNECT_TIMEOUT=10
   MAX_TIME=30
   BACKUP_KEEP=7
-  APPLY_NOW=1            # after install, do real update test
-  SHA256='...'           # optional SHA256 pinning for downloaded config
-  INSECURE_TLS=1         # use curl -k (enabled by default)
-  RESOLVE_HOST=''        # optional: force this hostname to resolve locally
-  RESOLVE_IP=''          # optional: local backend IP for RESOLVE_HOST
+  APPLY_NOW=1
+  SHA256='...'
+  INSECURE_TLS=1
+  RESOLVE_HOST=''
+  RESOLVE_IP=''
+
+Telegram IPv4 list options:
+  TELEGRAM_IP_LIST_URL=''       # URL with IPv4 CIDR list, one CIDR per line
+  TELEGRAM_IP_LIST_PATH='/etc/sing-box/telegram_ip_cidrs_v4.txt'
+  TELEGRAM_IP_LIST_SHA256=''    # optional SHA256 pinning for Telegram IP list
+  TELEGRAM_IPSET_NAME='telegram_ips'
+  TELEGRAM_RULE_NAME='mark_telegram_ips'
+  TELEGRAM_MARK_VALUE='0x1'
+  TELEGRAM_FIREWALL_SETUP=1
+  TELEGRAM_FIREWALL_RESTART=1
 
 Example:
-  APPLY_NOW=1 RUN_ON_BOOT=1 RUN_ON_WAN_UP=1 sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
-  RESOLVE_HOST='s3.example.com' RESOLVE_IP='192.168.1.10' INSECURE_TLS=1 sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
+  TELEGRAM_IP_LIST_URL='https://s3.example.com/path/telegram_ip_cidrs_v4.txt' \\
+    sh /root/install-singbox-updater.sh 'https://s3.example.com/path/config.json'
 USG
 }
 
@@ -256,6 +277,69 @@ validate_with_singbox_if_possible() {
 	return 0
 }
 
+normalize_ipv4_cidr_list() {
+	in_file="$1"
+	out_file="$2"
+
+	awk '
+	function trim(s) {
+		gsub(/^[ \t]+/, "", s)
+		gsub(/[ \t]+$/, "", s)
+		return s
+	}
+	BEGIN {
+		count = 0
+		err = 0
+	}
+	{
+		sub(/\r$/, "", $0)
+		sub(/#.*/, "", $0)
+		line = trim($0)
+		if (line == "") {
+			next
+		}
+
+		if (line !~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\/[0-9][0-9]*$/) {
+			print "invalid IPv4 CIDR line: " line > "/dev/stderr"
+			err = 1
+			exit
+		}
+
+		split(line, parts, "/")
+		prefix = parts[2] + 0
+		if (prefix < 0 || prefix > 32) {
+			print "invalid IPv4 CIDR prefix: " line > "/dev/stderr"
+			err = 1
+			exit
+		}
+
+		split(parts[1], octets, ".")
+		for (i = 1; i <= 4; i++) {
+			if (octets[i] !~ /^[0-9][0-9]*$/ || octets[i] < 0 || octets[i] > 255) {
+				print "invalid IPv4 octet: " line > "/dev/stderr"
+				err = 1
+				exit
+			}
+		}
+
+		if (!seen[line]) {
+			seen[line] = 1
+			print line
+			count++
+		}
+	}
+	END {
+		if (err) {
+			exit 1
+		}
+		if (count == 0) {
+			print "Telegram IPv4 CIDR list contains no usable entries" > "/dev/stderr"
+			exit 1
+		}
+	}
+	' "$in_file" > "$out_file"
+}
+
 ensure_cron_init() {
 	if [ -x /etc/init.d/cron ]; then
 		echo "/etc/init.d/cron"
@@ -266,6 +350,89 @@ ensure_cron_init() {
 		return 0
 	fi
 	return 1
+}
+
+ensure_telegram_ip_list_file() {
+	path="$1"
+	dir="$(dirname "$path")"
+
+	mkdir -p "$dir" || die "Cannot create Telegram IP list directory: $dir"
+
+	if [ ! -f "$path" ]; then
+		say "Telegram IP list file does not exist yet, creating empty placeholder: $path"
+		: > "$path" || die "Cannot create Telegram IP list file: $path"
+		chmod 600 "$path" >/dev/null 2>&1 || true
+		chown root:root "$path" >/dev/null 2>&1 || true
+	fi
+}
+
+find_firewall_section_by_name() {
+	type="$1"
+	name="$2"
+
+	uci -q show firewall 2>/dev/null | awk -F= -v type="$type" -v name="$name" '
+		$1 ~ "^firewall\\.@" type "\\[[0-9]+\\]\\.name$" {
+			v = $2
+			gsub(/\047/, "", v)
+			if (v == name) {
+				sub(/^firewall\./, "", $1)
+				sub(/\.name$/, "", $1)
+				print $1
+				exit
+			}
+		}
+	'
+}
+
+ensure_telegram_firewall_config() {
+	ipset_name="$1"
+	rule_name="$2"
+	list_path="$3"
+	mark_value="$4"
+
+	say "Ensuring firewall ipset '$ipset_name' uses loadfile: $list_path"
+
+	ipset_section="$(find_firewall_section_by_name ipset "$ipset_name" || true)"
+	if [ -n "$ipset_section" ]; then
+		ipset_ref="$ipset_section"
+		say "Found existing firewall ipset section: firewall.$ipset_ref"
+	else
+		ipset_ref="telegram_ips_auto"
+		uci -q delete "firewall.$ipset_ref" >/dev/null 2>&1 || true
+		uci set "firewall.$ipset_ref=ipset" || die "Failed to create firewall.$ipset_ref"
+		say "Created firewall ipset section: firewall.$ipset_ref"
+	fi
+
+	uci set "firewall.$ipset_ref.name=$ipset_name" || die "Failed to set firewall.$ipset_ref.name"
+	uci set "firewall.$ipset_ref.family=ipv4" || die "Failed to set firewall.$ipset_ref.family"
+	uci -q delete "firewall.$ipset_ref.match" >/dev/null 2>&1 || true
+	uci add_list "firewall.$ipset_ref.match=dest_net" || die "Failed to set firewall.$ipset_ref.match"
+	uci set "firewall.$ipset_ref.loadfile=$list_path" || die "Failed to set firewall.$ipset_ref.loadfile"
+
+	say "Ensuring firewall MARK rule '$rule_name' marks '$ipset_name' with $mark_value"
+
+	rule_section="$(find_firewall_section_by_name rule "$rule_name" || true)"
+	if [ -n "$rule_section" ]; then
+		rule_ref="$rule_section"
+		say "Found existing firewall rule section: firewall.$rule_ref"
+	else
+		rule_ref="telegram_ips_mark_auto"
+		uci -q delete "firewall.$rule_ref" >/dev/null 2>&1 || true
+		uci set "firewall.$rule_ref=rule" || die "Failed to create firewall.$rule_ref"
+		say "Created firewall rule section: firewall.$rule_ref"
+	fi
+
+	uci set "firewall.$rule_ref.name=$rule_name" || die "Failed to set firewall.$rule_ref.name"
+	uci set "firewall.$rule_ref.src=lan" || die "Failed to set firewall.$rule_ref.src"
+	uci set "firewall.$rule_ref.dest=*" || die "Failed to set firewall.$rule_ref.dest"
+	uci set "firewall.$rule_ref.proto=all" || die "Failed to set firewall.$rule_ref.proto"
+	uci set "firewall.$rule_ref.ipset=$ipset_name" || die "Failed to set firewall.$rule_ref.ipset"
+	uci set "firewall.$rule_ref.set_mark=$mark_value" || die "Failed to set firewall.$rule_ref.set_mark"
+	uci set "firewall.$rule_ref.target=MARK" || die "Failed to set firewall.$rule_ref.target"
+	uci set "firewall.$rule_ref.family=ipv4" || die "Failed to set firewall.$rule_ref.family"
+
+	uci commit firewall || die "Failed to commit firewall config"
+	say "Firewall Telegram ipset/rule config committed"
 }
 
 say "Checking sing-box presence"
@@ -292,6 +459,24 @@ if [ -n "$SHA256" ]; then
 fi
 rm -f "$TMP_CHECK" >/dev/null 2>&1 || true
 
+if [ -n "$TELEGRAM_IP_LIST_URL" ]; then
+	say "Checking Telegram IPv4 list source availability"
+	TMP_TG_RAW="/tmp/.singbox-updater-installer-telegram-raw.$$"
+	TMP_TG_NORM="/tmp/.singbox-updater-installer-telegram-normalized.$$"
+	rm -f "$TMP_TG_RAW" "$TMP_TG_NORM" >/dev/null 2>&1 || true
+
+	if fetch_url "$TELEGRAM_IP_LIST_URL" "$TMP_TG_RAW" && [ -s "$TMP_TG_RAW" ] && normalize_ipv4_cidr_list "$TMP_TG_RAW" "$TMP_TG_NORM"; then
+		TG_COUNT="$(wc -l < "$TMP_TG_NORM" | tr -d ' ')"
+		say "Telegram IPv4 list source check passed: $TG_COUNT CIDR entries"
+	else
+		say "WARNING: Telegram IPv4 list source check failed; installer will continue and runtime updater will keep existing list on failures"
+	fi
+
+	rm -f "$TMP_TG_RAW" "$TMP_TG_NORM" >/dev/null 2>&1 || true
+else
+	say "Telegram IPv4 list URL is not configured; Telegram ipset list update will be skipped"
+fi
+
 say "Writing /etc/config/singbox_updater"
 mkdir -p /etc/config
 [ -f /etc/config/singbox_updater ] || touch /etc/config/singbox_updater
@@ -309,6 +494,23 @@ uci set singbox_updater.main.backup_keep="$BACKUP_KEEP"
 uci set singbox_updater.main.run_on_boot="$RUN_ON_BOOT"
 uci set singbox_updater.main.run_on_wan_up="$RUN_ON_WAN_UP"
 uci set singbox_updater.main.insecure_tls="$INSECURE_TLS"
+uci set singbox_updater.main.telegram_ip_list_path="$TELEGRAM_IP_LIST_PATH"
+uci set singbox_updater.main.telegram_ipset_name="$TELEGRAM_IPSET_NAME"
+uci set singbox_updater.main.telegram_rule_name="$TELEGRAM_RULE_NAME"
+uci set singbox_updater.main.telegram_mark_value="$TELEGRAM_MARK_VALUE"
+uci set singbox_updater.main.telegram_firewall_setup="$TELEGRAM_FIREWALL_SETUP"
+uci set singbox_updater.main.telegram_firewall_restart="$TELEGRAM_FIREWALL_RESTART"
+
+if [ -n "$TELEGRAM_IP_LIST_URL" ]; then
+	uci set singbox_updater.main.telegram_ip_list_url="$TELEGRAM_IP_LIST_URL"
+else
+	uci -q delete singbox_updater.main.telegram_ip_list_url >/dev/null 2>&1 || true
+fi
+if [ -n "$TELEGRAM_IP_LIST_SHA256" ]; then
+	uci set singbox_updater.main.telegram_ip_list_sha256="$TELEGRAM_IP_LIST_SHA256"
+else
+	uci -q delete singbox_updater.main.telegram_ip_list_sha256 >/dev/null 2>&1 || true
+fi
 if [ -n "$RESOLVE_HOST" ]; then
 	uci set singbox_updater.main.resolve_host="$RESOLVE_HOST"
 else
@@ -325,6 +527,14 @@ else
 	uci -q delete singbox_updater.main.sha256 >/dev/null 2>&1 || true
 fi
 uci commit singbox_updater || die "Failed to commit /etc/config/singbox_updater"
+
+if [ "$TELEGRAM_FIREWALL_SETUP" = "1" ]; then
+	say "Preparing Telegram firewall ipset/rule"
+	ensure_telegram_ip_list_file "$TELEGRAM_IP_LIST_PATH"
+	ensure_telegram_firewall_config "$TELEGRAM_IPSET_NAME" "$TELEGRAM_RULE_NAME" "$TELEGRAM_IP_LIST_PATH" "$TELEGRAM_MARK_VALUE"
+else
+	say "Telegram firewall setup is disabled by TELEGRAM_FIREWALL_SETUP=$TELEGRAM_FIREWALL_SETUP"
+fi
 
 say "Writing /usr/bin/singbox-config-update"
 cat > /usr/bin/singbox-config-update <<'UPDATER_EOF'
@@ -495,7 +705,7 @@ usage() {
 Usage: $0 [options]
   -v, --verbose        verbose output
   --force              restart even if config unchanged
-  --dry-run            don't write config / restart (but download+validate+compare)
+  --dry-run            don't write config/list / restart firewall/sing-box
   --reason <text>      annotate logs (cron/boot/wanup/manual/installer)
   --install-cron       ensure cron entry exists (based on UCI schedule)
   --remove-cron        remove cron entry
@@ -533,6 +743,27 @@ restart_singbox() {
 		killall -HUP sing-box >/dev/null 2>&1 && return 0
 	fi
 	return 1
+}
+
+restart_firewall() {
+	if command -v service >/dev/null 2>&1; then
+		service firewall restart >/dev/null 2>&1 && return 0
+	fi
+	if [ -x /etc/init.d/firewall ]; then
+		/etc/init.d/firewall restart >/dev/null 2>&1 && return 0
+	fi
+	return 1
+}
+
+verify_firewall_set() {
+	ipset_name="$1"
+
+	if ! command -v nft >/dev/null 2>&1; then
+		log "nft is unavailable; cannot verify firewall set '$ipset_name'"
+		return 0
+	fi
+
+	nft list set inet fw4 "$ipset_name" >/dev/null 2>&1
 }
 
 validate_json_basic() {
@@ -585,6 +816,289 @@ fetch_to_file() {
 	return 127
 }
 
+normalize_ipv4_cidr_list() {
+	in_file="$1"
+	out_file="$2"
+
+	awk '
+	function trim(s) {
+		gsub(/^[ \t]+/, "", s)
+		gsub(/[ \t]+$/, "", s)
+		return s
+	}
+	BEGIN {
+		count = 0
+		err = 0
+	}
+	{
+		sub(/\r$/, "", $0)
+		sub(/#.*/, "", $0)
+		line = trim($0)
+		if (line == "") {
+			next
+		}
+
+		if (line !~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\/[0-9][0-9]*$/) {
+			print "invalid IPv4 CIDR line: " line > "/dev/stderr"
+			err = 1
+			exit
+		}
+
+		split(line, parts, "/")
+		prefix = parts[2] + 0
+		if (prefix < 0 || prefix > 32) {
+			print "invalid IPv4 CIDR prefix: " line > "/dev/stderr"
+			err = 1
+			exit
+		}
+
+		split(parts[1], octets, ".")
+		for (i = 1; i <= 4; i++) {
+			if (octets[i] !~ /^[0-9][0-9]*$/ || octets[i] < 0 || octets[i] > 255) {
+				print "invalid IPv4 octet: " line > "/dev/stderr"
+				err = 1
+				exit
+			}
+		}
+
+		if (!seen[line]) {
+			seen[line] = 1
+			print line
+			count++
+		}
+	}
+	END {
+		if (err) {
+			exit 1
+		}
+		if (count == 0) {
+			print "Telegram IPv4 CIDR list contains no usable entries" > "/dev/stderr"
+			exit 1
+		}
+	}
+	' "$in_file" > "$out_file"
+}
+
+find_firewall_section_by_name() {
+	type="$1"
+	name="$2"
+
+	uci -q show firewall 2>/dev/null | awk -F= -v type="$type" -v name="$name" '
+		$1 ~ "^firewall\\.@" type "\\[[0-9]+\\]\\.name$" {
+			v = $2
+			gsub(/\047/, "", v)
+			if (v == name) {
+				sub(/^firewall\./, "", $1)
+				sub(/\.name$/, "", $1)
+				print $1
+				exit
+			}
+		}
+	'
+}
+
+ensure_telegram_firewall_config() {
+	ipset_name="$1"
+	rule_name="$2"
+	list_path="$3"
+	mark_value="$4"
+
+	ipset_section="$(find_firewall_section_by_name ipset "$ipset_name" || true)"
+	if [ -n "$ipset_section" ]; then
+		ipset_ref="$ipset_section"
+		log "Telegram firewall ipset section exists: firewall.$ipset_ref"
+	else
+		ipset_ref="telegram_ips_auto"
+		uci -q delete "firewall.$ipset_ref" >/dev/null 2>&1 || true
+		uci set "firewall.$ipset_ref=ipset" || return 1
+		log "Telegram firewall ipset section created: firewall.$ipset_ref"
+	fi
+
+	uci set "firewall.$ipset_ref.name=$ipset_name" || return 1
+	uci set "firewall.$ipset_ref.family=ipv4" || return 1
+	uci -q delete "firewall.$ipset_ref.match" >/dev/null 2>&1 || true
+	uci add_list "firewall.$ipset_ref.match=dest_net" || return 1
+	uci set "firewall.$ipset_ref.loadfile=$list_path" || return 1
+
+	rule_section="$(find_firewall_section_by_name rule "$rule_name" || true)"
+	if [ -n "$rule_section" ]; then
+		rule_ref="$rule_section"
+		log "Telegram firewall MARK rule section exists: firewall.$rule_ref"
+	else
+		rule_ref="telegram_ips_mark_auto"
+		uci -q delete "firewall.$rule_ref" >/dev/null 2>&1 || true
+		uci set "firewall.$rule_ref=rule" || return 1
+		log "Telegram firewall MARK rule section created: firewall.$rule_ref"
+	fi
+
+	uci set "firewall.$rule_ref.name=$rule_name" || return 1
+	uci set "firewall.$rule_ref.src=lan" || return 1
+	uci set "firewall.$rule_ref.dest=*" || return 1
+	uci set "firewall.$rule_ref.proto=all" || return 1
+	uci set "firewall.$rule_ref.ipset=$ipset_name" || return 1
+	uci set "firewall.$rule_ref.set_mark=$mark_value" || return 1
+	uci set "firewall.$rule_ref.target=MARK" || return 1
+	uci set "firewall.$rule_ref.family=ipv4" || return 1
+
+	uci commit firewall || return 1
+	return 0
+}
+
+update_telegram_ip_list() {
+	tmpdir="$1"
+	reason="$2"
+	dryrun="$3"
+	retries="$4"
+	connect_timeout="$5"
+	max_time="$6"
+	insecure_tls="$7"
+	resolve_host="$8"
+	resolve_ip="$9"
+	ip_list_url="${10}"
+	ip_list_path="${11}"
+	ip_list_sha256="${12}"
+	ipset_name="${13}"
+	rule_name="${14}"
+	mark_value="${15}"
+	firewall_setup="${16}"
+	firewall_restart="${17}"
+
+	[ -n "$ip_list_url" ] || {
+		[ "$VERBOSE" -eq 1 ] && log "[$reason] Telegram IPv4 list URL is empty; skipping list update"
+		return 0
+	}
+
+	log "[$reason] checking Telegram IPv4 list from: $ip_list_url"
+
+	list_dir="$(dirname "$ip_list_path")"
+	mkdir -p "$list_dir" || {
+		log "ERROR: [$reason] cannot create Telegram IP list directory: $list_dir; keeping existing list"
+		return 0
+	}
+
+	raw="$tmpdir/telegram_ip_cidrs.raw"
+	normalized="$tmpdir/telegram_ip_cidrs.normalized"
+	rm -f "$raw" "$normalized" >/dev/null 2>&1 || true
+
+	attempt=1
+	sleep_s=2
+	ok=0
+	while [ "$attempt" -le "$retries" ]; do
+		if fetch_to_file "$ip_list_url" "$raw" "$connect_timeout" "$max_time" "$insecure_tls" "$resolve_host" "$resolve_ip"; then
+			ok=1
+			break
+		fi
+		log "[$reason] Telegram IPv4 list download failed (attempt $attempt/$retries), sleeping ${sleep_s}s"
+		sleep "$sleep_s" >/dev/null 2>&1 || true
+		sleep_s=$((sleep_s * 2))
+		attempt=$((attempt + 1))
+	done
+
+	if [ "$ok" -ne 1 ]; then
+		log "WARNING: [$reason] Telegram IPv4 list download failed after $retries attempts; keeping existing list"
+		return 0
+	fi
+
+	if [ ! -s "$raw" ]; then
+		log "WARNING: [$reason] downloaded Telegram IPv4 list is empty; keeping existing list"
+		return 0
+	fi
+
+	if [ -n "$ip_list_sha256" ]; then
+		if command -v sha256sum >/dev/null 2>&1; then
+			got="$(sha256sum "$raw" | awk '{print $1}')"
+			if [ "$got" != "$ip_list_sha256" ]; then
+				log "WARNING: [$reason] Telegram IPv4 list SHA256 mismatch (got $got, want $ip_list_sha256); keeping existing list"
+				return 0
+			fi
+		else
+			log "WARNING: [$reason] sha256sum unavailable; cannot verify Telegram IPv4 list SHA256; keeping existing list"
+			return 0
+		fi
+	fi
+
+	if ! normalize_ipv4_cidr_list "$raw" "$normalized"; then
+		log "WARNING: [$reason] Telegram IPv4 list validation failed; keeping existing list"
+		return 0
+	fi
+
+	entry_count="$(wc -l < "$normalized" | tr -d ' ')"
+	log "[$reason] Telegram IPv4 list validated: $entry_count CIDR entries"
+
+	if [ -f "$ip_list_path" ] && cmp -s "$normalized" "$ip_list_path"; then
+		log "[$reason] Telegram IPv4 list has no changes"
+		return 0
+	fi
+
+	if [ "$dryrun" -eq 1 ]; then
+		log "[$reason] Telegram IPv4 list differs; --dry-run: would replace $ip_list_path and restart firewall"
+		return 0
+	fi
+
+	backup=""
+	if [ -f "$ip_list_path" ]; then
+		ts="$(date +%Y%m%d%H%M%S)"
+		backup="${ip_list_path}.bak.${ts}"
+		cp "$ip_list_path" "$backup" >/dev/null 2>&1 || backup=""
+		[ -n "$backup" ] && log "[$reason] Telegram IPv4 list backup created: $backup"
+	fi
+
+	stage="$list_dir/.telegram_ip_cidrs.stage.$$"
+	rm -f "$stage" >/dev/null 2>&1 || true
+
+	cp "$normalized" "$stage" || {
+		log "ERROR: [$reason] failed to stage Telegram IPv4 list; keeping existing list"
+		rm -f "$stage" >/dev/null 2>&1 || true
+		return 0
+	}
+	chmod 600 "$stage" >/dev/null 2>&1 || true
+	chown root:root "$stage" >/dev/null 2>&1 || true
+
+	if ! mv -f "$stage" "$ip_list_path"; then
+		log "ERROR: [$reason] failed to replace Telegram IPv4 list; keeping existing list"
+		rm -f "$stage" >/dev/null 2>&1 || true
+		return 0
+	fi
+
+	sync >/dev/null 2>&1 || true
+	log "[$reason] Telegram IPv4 list updated: $ip_list_path"
+
+	if [ "$firewall_setup" = "1" ]; then
+		if ensure_telegram_firewall_config "$ipset_name" "$rule_name" "$ip_list_path" "$mark_value"; then
+			log "[$reason] Telegram firewall ipset/rule config is ensured"
+		else
+			log "ERROR: [$reason] failed to ensure Telegram firewall ipset/rule config"
+		fi
+	fi
+
+	if [ "$firewall_restart" = "1" ]; then
+		log "[$reason] restarting firewall to reload Telegram IPv4 ipset"
+		if restart_firewall; then
+			if verify_firewall_set "$ipset_name"; then
+				log "[$reason] firewall restarted and set '$ipset_name' verified"
+			else
+				log "ERROR: [$reason] firewall restarted, but nft set '$ipset_name' was not found"
+				if [ -n "$backup" ] && [ -f "$backup" ]; then
+					cp "$backup" "$ip_list_path" >/dev/null 2>&1 || true
+					restart_firewall >/dev/null 2>&1 || true
+					log "[$reason] rolled Telegram IPv4 list back to previous backup"
+				fi
+			fi
+		else
+			log "ERROR: [$reason] firewall restart failed after Telegram IPv4 list update"
+			if [ -n "$backup" ] && [ -f "$backup" ]; then
+				cp "$backup" "$ip_list_path" >/dev/null 2>&1 || true
+				restart_firewall >/dev/null 2>&1 || true
+				log "[$reason] rolled Telegram IPv4 list back to previous backup"
+			fi
+		fi
+	else
+		log "[$reason] TELEGRAM_FIREWALL_RESTART is disabled; firewall was not restarted"
+	fi
+
+	return 0
+}
+
 install_cron() {
 	schedule="$(get_uci schedule)"
 	[ -n "$schedule" ] || schedule="0 4 * * *"
@@ -630,7 +1144,7 @@ rotate_backups() {
 	[ -f "$CFG" ] || return 0
 	i=0
 	for f in $(ls -1t "${CFG}.bak."* 2>/dev/null); do
-		i=$((i+1))
+		i=$((i + 1))
 		if [ "$i" -gt "$keep" ]; then
 			rm -f "$f" >/dev/null 2>&1 || true
 		fi
@@ -660,6 +1174,21 @@ main_update() {
 	resolve_ip="$(get_uci resolve_ip)"
 	want_sha256="$(get_uci sha256)"
 
+	telegram_ip_list_url="$(get_uci telegram_ip_list_url)"
+	telegram_ip_list_path="$(get_uci telegram_ip_list_path)"
+	[ -n "$telegram_ip_list_path" ] || telegram_ip_list_path="/etc/sing-box/telegram_ip_cidrs_v4.txt"
+	telegram_ip_list_sha256="$(get_uci telegram_ip_list_sha256)"
+	telegram_ipset_name="$(get_uci telegram_ipset_name)"
+	[ -n "$telegram_ipset_name" ] || telegram_ipset_name="telegram_ips"
+	telegram_rule_name="$(get_uci telegram_rule_name)"
+	[ -n "$telegram_rule_name" ] || telegram_rule_name="mark_telegram_ips"
+	telegram_mark_value="$(get_uci telegram_mark_value)"
+	[ -n "$telegram_mark_value" ] || telegram_mark_value="0x1"
+	telegram_firewall_setup="$(get_uci telegram_firewall_setup)"
+	[ -n "$telegram_firewall_setup" ] || telegram_firewall_setup=1
+	telegram_firewall_restart="$(get_uci telegram_firewall_restart)"
+	[ -n "$telegram_firewall_restart" ] || telegram_firewall_restart=1
+
 	ensure_dirs
 
 	if [ "$REASON" = "boot" ] && command -v ubus >/dev/null 2>&1; then
@@ -681,10 +1210,6 @@ main_update() {
 	mkdir -p "$TMPDIR" || die "Cannot create $TMPDIR"
 	rm -f "$NEW" >/dev/null 2>&1 || true
 
-	# resolve_host + resolve_ip exist for the case where the config source
-	# sits behind this same router. The public hostname points to this
-	# router's WAN IP, but the router itself should connect directly to the
-	# LAN backend while keeping the original hostname for TLS SNI and Host.
 	log "[$REASON] checking config from: $url"
 	[ -n "$resolve_host" ] && [ -n "$resolve_ip" ] && log "[$REASON] local resolve override configured: $resolve_host -> $resolve_ip"
 
@@ -698,8 +1223,8 @@ main_update() {
 		fi
 		log "[$REASON] download failed (attempt $attempt/$retries), sleeping ${sleep_s}s"
 		sleep "$sleep_s" >/dev/null 2>&1 || true
-		sleep_s=$((sleep_s*2))
-		attempt=$((attempt+1))
+		sleep_s=$((sleep_s * 2))
+		attempt=$((attempt + 1))
 	done
 	[ "$ok" -eq 1 ] || die "Download failed after $retries attempts"
 	[ -s "$NEW" ] || die "Downloaded file is empty"
@@ -716,20 +1241,39 @@ main_update() {
 	validate_json_basic "$NEW" || die "Downloaded file doesn't look like valid JSON"
 	validate_with_singbox_if_possible "$NEW" || die "sing-box validation failed for new config"
 
+	update_telegram_ip_list \
+		"$TMPDIR" \
+		"$REASON" \
+		"$DRYRUN" \
+		"$retries" \
+		"$connect_timeout" \
+		"$max_time" \
+		"$insecure_tls" \
+		"$resolve_host" \
+		"$resolve_ip" \
+		"$telegram_ip_list_url" \
+		"$telegram_ip_list_path" \
+		"$telegram_ip_list_sha256" \
+		"$telegram_ipset_name" \
+		"$telegram_rule_name" \
+		"$telegram_mark_value" \
+		"$telegram_firewall_setup" \
+		"$telegram_firewall_restart"
+
 	if [ -f "$CFG" ] && cmp -s "$NEW" "$CFG"; then
 		if [ "$FORCE" -eq 1 ]; then
 			if [ "$DRYRUN" -eq 1 ]; then
-				log "[$REASON] no changes, but --force + --dry-run: would restart sing-box"
+				log "[$REASON] no config changes, but --force + --dry-run: would restart sing-box"
 				exit 0
 			fi
 			if restart_singbox; then
-				log "[$REASON] no changes, but --force: sing-box restarted"
+				log "[$REASON] no config changes, but --force: sing-box restarted"
 				exit 0
 			else
-				die "No changes, but failed to restart sing-box"
+				die "No config changes, but failed to restart sing-box"
 			fi
 		fi
-		log "[$REASON] no changes"
+		log "[$REASON] no config changes"
 		exit 0
 	fi
 
@@ -756,7 +1300,7 @@ main_update() {
 	sync >/dev/null 2>&1 || true
 
 	if restart_singbox; then
-		log "[$REASON] updated and restarted sing-box"
+		log "[$REASON] config updated and sing-box restarted"
 		exit 0
 	fi
 
@@ -833,6 +1377,13 @@ echo "url=$(uci -q get singbox_updater.main.url 2>/dev/null || true)"
 echo "insecure_tls=$(uci -q get singbox_updater.main.insecure_tls 2>/dev/null || true)"
 echo "resolve_host=$(uci -q get singbox_updater.main.resolve_host 2>/dev/null || true)"
 echo "resolve_ip=$(uci -q get singbox_updater.main.resolve_ip 2>/dev/null || true)"
+echo "telegram_ip_list_url=$(uci -q get singbox_updater.main.telegram_ip_list_url 2>/dev/null || true)"
+echo "telegram_ip_list_path=$(uci -q get singbox_updater.main.telegram_ip_list_path 2>/dev/null || true)"
+echo "telegram_ipset_name=$(uci -q get singbox_updater.main.telegram_ipset_name 2>/dev/null || true)"
+echo "telegram_rule_name=$(uci -q get singbox_updater.main.telegram_rule_name 2>/dev/null || true)"
+echo "telegram_mark_value=$(uci -q get singbox_updater.main.telegram_mark_value 2>/dev/null || true)"
+echo "telegram_firewall_setup=$(uci -q get singbox_updater.main.telegram_firewall_setup 2>/dev/null || true)"
+echo "telegram_firewall_restart=$(uci -q get singbox_updater.main.telegram_firewall_restart 2>/dev/null || true)"
 
 say "Running dry-run self-test"
 /usr/bin/singbox-config-update --reason installer --dry-run -v || die "Dry-run self-test failed"
@@ -849,6 +1400,17 @@ echo
 echo "===== STATUS ====="
 date || true
 echo
+echo "[telegram ip list]"
+ls -l "$(uci -q get singbox_updater.main.telegram_ip_list_path 2>/dev/null || echo /etc/sing-box/telegram_ip_cidrs_v4.txt)" 2>/dev/null || true
+echo
+echo "[telegram firewall set]"
+if command -v nft >/dev/null 2>&1; then
+	nft list set inet fw4 "$(uci -q get singbox_updater.main.telegram_ipset_name 2>/dev/null || echo telegram_ips)" 2>/dev/null || true
+fi
+echo
+echo "[telegram firewall rule]"
+nft list ruleset 2>/dev/null | grep -A5 -B5 "$(uci -q get singbox_updater.main.telegram_ipset_name 2>/dev/null || echo telegram_ips)" || true
+echo
 echo "[cron line]"
 grep -n 'singbox-updater' /etc/crontabs/root || true
 echo
@@ -856,13 +1418,16 @@ echo "[cron process]"
 ps | grep -E '[c]rond|[c]ron' || true
 echo
 echo "[init scripts]"
-ls -1 /etc/init.d | grep -i 'sing\|cron' || true
+ls -1 /etc/init.d | grep -i 'sing\|cron\|firewall' || true
 echo
 echo "[recent singbox-updater logs]"
-logread -e singbox-updater | tail -n 30 || true
+logread -e singbox-updater | tail -n 40 || true
 echo
-echo "[uci config]"
+echo "[uci updater config]"
 uci show singbox_updater || true
+echo
+echo "[uci firewall telegram entries]"
+uci show firewall | grep -E "telegram_ips|mark_telegram_ips" || true
 echo "===== DONE ====="
 
 say "Installation completed successfully"
